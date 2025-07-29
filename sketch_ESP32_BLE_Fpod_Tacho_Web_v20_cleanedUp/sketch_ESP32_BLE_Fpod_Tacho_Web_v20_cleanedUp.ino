@@ -1,563 +1,429 @@
-//HUGE APP (3mb NO OTA/1MB SPIFFS)
-
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include <BLE2902.h>
+#include <Wire.h>
+#include <TimeLib.h>
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
 #include <math.h>
 
-/// BLE 1 start:  variables will change:
-int buttonState = 0;         // variable for reading the pushbutton status
-bool        is_inst_stride_len_present = 1;                                 /**< True if Instantaneous Stride Length is present in the measurement. */
-bool        is_total_distance_present = 1;                                  /**< True if Total Distance is present in the measurement. */
-bool        is_running = 1;                                                 /**< True if running, False if walking. */
-uint16_t    inst_speed = 40;                                                 /**< Instantaneous Speed. */
-uint8_t     inst_cadence = 1;                                               /**< Instantaneous Cadence. */
-uint16_t    inst_stride_length = 1;                                         /**< Instantaneous Stride Length. */
-uint32_t    total_distance = 10;
-int delayint = 500;
-volatile unsigned int counter;
-float rpm = 0;
-float mpsOffset = 0;                                                        //used for BLE
-volatile long gx_lastRiseTime = 0; 
-volatile long mz_lastRiseTime = 0; 
+// ============================================================================
+// CONFIGURATION & CONSTANTS
+// ============================================================================
+const char* WIFI_SSID = "chicago";
+const char* WIFI_PASSWORD = "Neukirch20211!";
+const char* BLE_DEVICE_NAME = "Treadmill_Rieger";
 
-volatile long firstButtonPress = 0;
-///float kmph;
-float mps = 0;
-///float kmphStatic;
-byte fakePos[1] = {1};
-bool _BLEClientConnected = false;
+// Hardware pins
+const int INTERRUPT_PIN = 3;
+const int LED_PIN = 2;
 
-#define RSCService BLEUUID((uint16_t)0x1814)
-BLECharacteristic RSCMeasurementCharacteristics(BLEUUID((uint16_t)0x2A53), BLECharacteristic::PROPERTY_NOTIFY);
-BLECharacteristic sensorPositionCharacteristic(BLEUUID((uint16_t)0x2A5D), BLECharacteristic::PROPERTY_READ);
+// Treadmill mechanics
+const long BELT_DISTANCE_MM = 142;  // Belt distance per revolution in mm
+const long DEBOUNCE_THRESHOLD_US = 300;  // Minimum time between valid interrupts
+const long MAX_REVOLUTION_TIME_US = 1000000;  // Max time for valid revolution (1 second)
 
-BLEDescriptor RSCDescriptor(BLEUUID((uint16_t)0x2901));
-BLEDescriptor sensorPositionDescriptor(BLEUUID((uint16_t)0x2901));
+// BLE UUIDs
+#define RSC_SERVICE_UUID BLEUUID((uint16_t)0x1814)
+#define RSC_MEASUREMENT_UUID BLEUUID((uint16_t)0x2A53)
+#define SENSOR_POSITION_UUID BLEUUID((uint16_t)0x2A5D)
 
-class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
-      _BLEClientConnected = true;
-    };
+// Update intervals
+const unsigned long DISPLAY_UPDATE_INTERVAL = 1000;  // 1 second
+const unsigned long WEB_UPDATE_INTERVAL = 1000;      // 1 second
 
-    void onDisconnect(BLEServer* pServer) {
-      _BLEClientConnected = false;
+// ============================================================================
+// GLOBAL VARIABLES
+// ============================================================================
+struct TreadmillMetrics {
+    volatile unsigned long startTime = 0;
+    volatile unsigned int revCount = 0;
+    volatile unsigned int totalRevCount = 0;
+    volatile long accumulatorInterval = 0;
+    volatile unsigned long longPauseTime = 0;
+    
+    float rpm = 0;
+    float mps = 0;
+    float mpsOffset = 0;
+    long workoutDistance = 0;  // in mm
+    unsigned long workoutStartTime = 0;
+    unsigned long lastUpdate = 0;
+};
+
+struct BLEData {
+    bool clientConnected = false;
+    uint16_t instSpeed = 40;
+    uint8_t instCadence = 1;
+    uint16_t instStrideLength = 1;
+    uint32_t totalDistance = 10;
+    byte fakePos[1] = {1};
+};
+
+TreadmillMetrics metrics;
+BLEData bleData;
+
+// BLE objects
+BLEServer* pServer = nullptr;
+BLECharacteristic* pRSCMeasurement = nullptr;
+BLECharacteristic* pSensorPosition = nullptr;
+AsyncWebServer server(80);
+
+// ============================================================================
+// INTERRUPT HANDLER
+// ============================================================================
+void IRAM_ATTR tachInterrupt() {
+    unsigned long usNow = micros();
+    long elapsed = usNow - metrics.startTime;
+    
+    // Debounce check
+    if (elapsed < DEBOUNCE_THRESHOLD_US) {
+        return;
+    }
+    
+    // Reset if too much time has passed (treadmill stopped)
+    if (elapsed > MAX_REVOLUTION_TIME_US) {
+        metrics.startTime = usNow;
+        metrics.longPauseTime = 0;
+        return;
+    }
+    
+    // Valid revolution detected
+    if (elapsed > metrics.longPauseTime / 2) {
+        metrics.startTime = usNow;
+        metrics.longPauseTime = elapsed;
+        metrics.revCount++;
+        metrics.totalRevCount++;
+        metrics.workoutDistance += BELT_DISTANCE_MM;
+        metrics.accumulatorInterval += elapsed;
+    }
+}
+
+// ============================================================================
+// BLE CALLBACKS AND FUNCTIONS
+// ============================================================================
+class ServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override {
+        bleData.clientConnected = true;
+        Serial.println("BLE client connected");
+    }
+    
+    void onDisconnect(BLEServer* pServer) override {
+        bleData.clientConnected = false;
+        Serial.println("BLE client disconnected");
+        // Restart advertising
+        pServer->getAdvertising()->start();
     }
 };
-/// BLE 1 end  
 
-//> Tacho Stuff1 start  Copied from "sketch_ESP32_RPR220_TACHO_130720_v6"
-#include <Wire.h>
-#include <TimeLib.h>  //https://playground.arduino.cc/Code/Time/
-
-// constants won't change. They're used here to set pin numbers:
-// External interupt pin for sensor
-#define interruptPin 3      // the number of the IR Receiver pin
-
-const int ledpin2 =  2;      // the number of the LED  pin 
-int ledState = LOW;             // ledState used to set the LED
-
-long lastUpdate = 0;  // for timing display updates
-volatile long accumulator4 = 0;  // sum of last 4 rpm times over 4 seconds
-
-volatile long accumulatorInterval = 0;  // time sum between display during intervals
-float rpmaccumulatorInterval = 0;
-
-volatile unsigned long startTime = 0; // start of revolution in microseconds
-volatile unsigned int revCount = 0; // number of revolutions since last display update
-volatile unsigned int Totalrevcount = 0; // number of revolutions since last display update
-volatile unsigned long longpauseTime = 0; // revolution time with no relection
-volatile long belt_distance = 142; //mm  Belt was measured to be 2.11m between belt markings. (or Diameter of belt roller).  Back roller calculated to be 0.120471m circumference
-volatile long workout_distance = 0; //Running tally of workout distance
-volatile unsigned long workout_startTime = 0; // start of Workout
-// Tacho Stuff1 end
-
-
-///Taco Stuff 4 start
-//-------------------------------------
-// Interrupt Handler
-// IR reflective sensor - target passed
-// Calculate revolution time
-//-------------------------------------
-void IRAM_ATTR tach_interrupt()
-{
-  //Serial.println("Interupt");
-  // calculate the microseconds since the last interrupt.  Interupt activates on falling edge. (IR detected)
-  long usNow = micros();
-  long test_elapsed = usNow - startTime;
-
-  if(test_elapsed<300){  //assume this is button bounce if interupt activated less than 30000 microseconds since last interupt.  
-    return;
-  }
-
-  if(test_elapsed>1000000){  //assume the treadmill isn't spinning in 1 second.
-    startTime = usNow;       // reset the clock;
-    longpauseTime = 0;  
-    return;
-  }
-  if(test_elapsed > longpauseTime/2){  //acts as a debounce, don't looking for interupts soon after the first hit.  
-      //Serial.println(test_elapsed); //Serial.println(" Counted");
-      startTime = usNow;  // reset the clock
-      long elapsed = test_elapsed ;
-      longpauseTime = test_elapsed ;
-
-      revCount++;
-      workout_distance += belt_distance; //Running tally of workout distance
-      Totalrevcount += 1;
-      accumulatorInterval += elapsed;
-
-  }
-  
-}
-///Taco Stuff 4 end
-
-void InitBLE() {
-  BLEDevice::init("Treadmil_Rieger");
-  // CBLE Server
-  BLEServer *pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  // Do some BLE Setup
-  BLEService *pRSC = pServer->createService(RSCService);
-
-  pRSC->addCharacteristic(&RSCMeasurementCharacteristics);
-  RSCDescriptor.setValue("Send all your RCSM rubbish here");
-  RSCMeasurementCharacteristics.addDescriptor(&RSCDescriptor);
-  RSCMeasurementCharacteristics.addDescriptor(new BLE2902());
-
-  pRSC->addCharacteristic(&sensorPositionCharacteristic);
-  pServer->getAdvertising()->addServiceUUID(RSCService);
-  pRSC->start();
-  pServer->getAdvertising()->start();
+void initBLE() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+    
+    BLEService* pRSCService = pServer->createService(RSC_SERVICE_UUID);
+    
+    // RSC Measurement Characteristic
+    pRSCMeasurement = pRSCService->createCharacteristic(
+        RSC_MEASUREMENT_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pRSCMeasurement->addDescriptor(new BLE2902());
+    
+    // Sensor Position Characteristic
+    pSensorPosition = pRSCService->createCharacteristic(
+        SENSOR_POSITION_UUID,
+        BLECharacteristic::PROPERTY_READ
+    );
+    
+    pRSCService->start();
+    pServer->getAdvertising()->addServiceUUID(RSC_SERVICE_UUID);
+    pServer->getAdvertising()->start();
+    
+    Serial.println("BLE service started");
 }
 
-void InitTacho(){
-  //pinMode(ledIRTransmit, OUTPUT);     // initialize the IR Transmitter pin as an output:
-  //digitalWrite(ledIRTransmit, HIGH);  // turn on IR Transmitter 
- 
-  // Enable the pullup resistor and attach the interrupt. Pin is high by default unless the IR receiver detects light.
-  pinMode(interruptPin, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(interruptPin), tach_interrupt, FALLING);
-
-  //Timer
-  setTime(0,0,0,0,0,0);                   //setTime(hr,min,sec,day,month,yr); // Another way to set time.  
+void sendBLEData() {
+    if (!bleData.clientConnected || !pRSCMeasurement) {
+        return;
+    }
+    
+    bleData.instSpeed = (metrics.mps + metrics.mpsOffset) * 256;
+    bleData.totalDistance = metrics.workoutDistance / 100;  // Convert mm to cm
+    
+    byte dataPacket[10] = {
+        3,  // Flags
+        (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),
+        bleData.instCadence,
+        (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8),
+        (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),
+        (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24)
+    };
+    
+    pRSCMeasurement->setValue(dataPacket, 10);
+    pRSCMeasurement->notify();
+    pSensorPosition->setValue(bleData.fakePos, 1);
 }
 
-
-///////////////////////////////////
-///////////////////////////////////
-#include "WiFi.h"
-#include "ESPAsyncWebServer.h"
-
-const char *ssid = "chicago";
-const char *password = "Neukirch20211!";
-//float h = 0;  //temp
-
-// Create AsyncWebServer object on port 80
-AsyncWebServer server(80);
-String readSpeed() {
-    return String(mps*3.6);
-}
-String readDistance() {
-    return String(workout_distance/1000);
-}
-String readRpm() {
-    return String(int(rpm));
-}
-String readHour() {
-    return String(hour());
-}
-String readMinute() {
-    return String(minute());
-}
-String readSecond() {
-    return String(second());
-}
-String readZoffset() {
-    return String(mpsOffset*3.6);
-}
-String readTotalrevcount() {
-    return String(Totalrevcount);
-}
-String readZoffsetup() {
-    mpsOffset += 0.139;
-    Serial.print("UP * "); Serial.print(mpsOffset*3.6); Serial.println("km/h");
-    return String(mpsOffset);
-}
-String readZoffsetdown() {
-       if (mpsOffset < 0.139){
-          mpsOffset = 0;
-       }
-       if (mpsOffset >= 0.139){
-          mpsOffset -= 0.139;
-       }
-
-       Serial.print("Down * "); Serial.print(mpsOffset*3.6); Serial.println("km/h");
-   
-    return String(mpsOffset);
-}
-String readReset() {
-    //reset all variables
-    workout_distance = 0;
-    setTime(0,0,0,0,0,0);                   //setTime(hr,min,sec,day,month,yr); // Another way to set time.  
-    Totalrevcount = 0;
-    return String(mpsOffset);
+// ============================================================================
+// CALCULATION FUNCTIONS
+// ============================================================================
+void calculateRPM() {
+    if (metrics.revCount > 0) {
+        metrics.rpm = 60000000.0 / (metrics.accumulatorInterval / metrics.revCount);
+        metrics.accumulatorInterval = 0;
+    } else {
+        metrics.rpm = 0;
+    }
+    metrics.revCount = 0;
 }
 
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html>
+void calculateSpeed() {
+    // Speed = distance_per_rev * rev_per_min * min_per_sec * m_per_mm
+    metrics.mps = (BELT_DISTANCE_MM * metrics.rpm) / (60.0 * 1000.0);
+}
+
+void updateMetrics() {
+    calculateRPM();
+    calculateSpeed();
+}
+
+// ============================================================================
+// WEB SERVER FUNCTIONS
+// ============================================================================
+String getSpeed() { return String(metrics.mps * 3.6, 1); }  // km/h with 1 decimal
+String getDistance() { return String(metrics.workoutDistance / 1000.0, 0); }  // meters
+String getRPM() { return String((int)metrics.rpm); }
+String getHour() { return String(hour()); }
+String getMinute() { return String(minute()); }
+String getSecond() { return String(second()); }
+String getOffset() { return String(metrics.mpsOffset * 3.6, 1); }  // km/h
+String getTotalRevs() { return String(metrics.totalRevCount); }
+
+void adjustOffsetUp() {
+    metrics.mpsOffset += 0.139;  // ~0.5 km/h increment
+    Serial.printf("Offset UP: %.1f km/h\n", metrics.mpsOffset * 3.6);
+}
+
+void adjustOffsetDown() {
+    if (metrics.mpsOffset >= 0.139) {
+        metrics.mpsOffset -= 0.139;
+    } else {
+        metrics.mpsOffset = 0;
+    }
+    Serial.printf("Offset DOWN: %.1f km/h\n", metrics.mpsOffset * 3.6);
+}
+
+void resetWorkout() {
+    metrics.workoutDistance = 0;
+    metrics.totalRevCount = 0;
+    setTime(0, 0, 0, 0, 0, 0);
+    Serial.println("Workout reset");
+}
+
+const char* HTML_TEMPLATE = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css">
   <style>
-    html {
-     font-family: Arial;
-     display: inline-block;
-     margin: 0px auto;
-     text-align: center;
-    }
+    html { font-family: Arial; display: inline-block; margin: 0px auto; text-align: center; }
     h2 { font-size: 3.0rem; }
     p { font-size: 3.0rem; }
     .units { font-size: 1.2rem; }
-    .dht-labels{
-      font-size: 1.5rem;
-      vertical-align:middle;
-      padding-bottom: 15px;
-    }
-    
-.button {
-  border: none;
-  color: white;
-  padding: 15px 32px;
-  text-align: center;
-  text-decoration: none;
-  display: inline-block;
-  font-size: 16px;
-  margin: 4px 2px;
-  cursor: pointer;
-}
-.button1 {background-color: #4CAF50;} /* Green */
-.button2 {background-color: #008CBA;} /* Blue */
-.button3 {background-color: #cc0000;} /* Red */
+    .button { border: none; color: white; padding: 15px 32px; text-align: center; 
+              text-decoration: none; display: inline-block; font-size: 16px; 
+              margin: 4px 2px; cursor: pointer; }
+    .button1 { background-color: #4CAF50; }
+    .button2 { background-color: #008CBA; }
+    .button3 { background-color: #cc0000; }
   </style>
 </head>
 <body>
-   <p>
-    <i class="fas fa-running" style="color:#059e8a;"></i> 
-    <!-- <span class="dht-labels">Speed</span> -->
-    <span id="speed">%SPEED%</span>
-    <sup class="units">kph</sup>
-  </p>
-    <p>
-    <i class="fas fa-shoe-prints" style="color:#2d0000;"></i> 
-    &nbsp;&nbsp;
-    <!-- <span class="dht-labels">Distance</span> -->
-    <span id="distance">%DISTANCE%</span>
-    <sup class="units">M</sup>
-  </p>
-  <p>
-   <i class="fas fa-stopwatch" style="color:#059e8a;"></i> 
-    <!-- <span class="dht-labels">Time</span> --> 
-    <span id="hour">%HOUR%</span>
-    :
-    <span id="minute">%MINUTE%</span>
-    :
-    <span id="second">%SECOND%</span>
-  </p>
-   <p>
-    <i class="fas fa-arrows-alt-h" style="color:#059e8a;"></i> 
-    <!-- <span class="dht-labels">Zoffset</span> --> 
-    <span id="zoffset">%ZOFFSET%</span>
-    <sup class="units">kph</sup>
-  <br>
-    <a href=/zoffsetup\><button class="button button1">&nbsp;Up&nbsp;</button></a>    
-    <a href=/><button class="button button2">Down</button></a>
-  </p>
-  <p>
-    <i class="fas fa-tachometer-alt" style="color:#00add6;"></i> 
-    <!-- <span class="dht-labels">Rpm</span> --> 
-    <span id="rpm">%RPM%</span>
-    <sup class="units">rpm</sup>
-  </p>
-    <p>
-    <i class="fas fa-tachometer-alt" style="color:#00add6;"></i> 
-    <!-- <span class="dht-labels">Totalrevcount</span> --> 
-    <span id="totalrevcount">%TOTALREVCOUNT%</span>
-    <sup class="units">total</sup>
-  </p>
-  <p>
-  <a href=/reset\><button class="button button3">&nbsp;Reset&nbsp;</button></a> 
-  </p>
-  <h4>Treadmil Rieger</h4>
-   
-</body>
+  <h2>Treadmill Monitor</h2>
+  
+  <p><i class="fas fa-running" style="color:#059e8a;"></i> 
+     <span id="speed">%SPEED%</span><sup class="units">km/h</sup></p>
+  
+  <p><i class="fas fa-shoe-prints" style="color:#2d0000;"></i> 
+     <span id="distance">%DISTANCE%</span><sup class="units">m</sup></p>
+  
+  <p><i class="fas fa-stopwatch" style="color:#059e8a;"></i> 
+     <span id="hour">%HOUR%</span>:<span id="minute">%MINUTE%</span>:<span id="second">%SECOND%</span></p>
+  
+  <p><i class="fas fa-arrows-alt-h" style="color:#059e8a;"></i> 
+     <span id="offset">%OFFSET%</span><sup class="units">km/h offset</sup><br>
+     <a href="/offset/up"><button class="button button1">Up</button></a>
+     <a href="/offset/down"><button class="button button2">Down</button></a></p>
+  
+  <p><i class="fas fa-tachometer-alt" style="color:#00add6;"></i> 
+     <span id="rpm">%RPM%</span><sup class="units">rpm</sup></p>
+  
+  <p><i class="fas fa-chart-line" style="color:#00add6;"></i> 
+     <span id="revs">%REVS%</span><sup class="units">total revs</sup></p>
+  
+  <p><a href="/reset"><button class="button button3">Reset Workout</button></a></p>
+
 <script>
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("speed").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/speed", true);
-  xhttp.send();
-}, 1000 ) ;
+function updateValue(id, endpoint) {
+  fetch('/' + endpoint)
+    .then(response => response.text())
+    .then(data => document.getElementById(id).innerHTML = data)
+    .catch(error => console.error('Error:', error));
+}
 
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("distance").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/distance", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("hour").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/hour", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("minute").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/minute", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("second").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/second", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("zoffset").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/zoffset", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("rpm").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/rpm", true);
-  xhttp.send();
-}, 1000 ) ;
-
-setInterval(function ( ) {
-  var xhttp = new XMLHttpRequest();
-  xhttp.onreadystatechange = function() {
-    if (this.readyState == 4 && this.status == 200) {
-      document.getElementById("totalrevcount").innerHTML = this.responseText;
-    }
-  };
-  xhttp.open("GET", "/totalrevcount", true);
-  xhttp.send();
-}, 1000 ) ;
-
+setInterval(() => {
+  updateValue('speed', 'api/speed');
+  updateValue('distance', 'api/distance');
+  updateValue('hour', 'api/hour');
+  updateValue('minute', 'api/minute');
+  updateValue('second', 'api/second');
+  updateValue('offset', 'api/offset');
+  updateValue('rpm', 'api/rpm');
+  updateValue('revs', 'api/revs');
+}, 1000);
 </script>
+</body>
 </html>)rawliteral";
 
-// Replaces placeholder with DHT values
-String processor(const String& var){
-  //Serial.println(var);
-  if(var == "RPM"){
-    return readRpm();
-  }
-  //else if(var == "HUMIDITY"){  return readDHTHumidity();  }
-  else if(var == "SPEED"){
-    return readSpeed();
-  }
-  else if(var == "DISTANCE"){
-    return readDistance();
-  }
-  else if(var == "HOUR"){
-    return readHour();
-  }
-  else if(var == "MINUTE"){
-    return readMinute();
-  }
-  else if(var == "SECOND"){
-    return readSecond();
-  }
-  else if(var == "ZOFFSET"){
-    return readZoffset();
-  }
-  else if(var == "TOTALREVCOUNT"){
-    return readTotalrevcount();
-  }
-  return String();
+String processTemplate(const String& var) {
+    if (var == "SPEED") return getSpeed();
+    if (var == "DISTANCE") return getDistance();
+    if (var == "HOUR") return getHour();
+    if (var == "MINUTE") return getMinute();
+    if (var == "SECOND") return getSecond();
+    if (var == "OFFSET") return getOffset();
+    if (var == "RPM") return getRPM();
+    if (var == "REVS") return getTotalRevs();
+    return String();
 }
-////////////////////////////////////////////////////////////////////////
-////////////////////////////////////////////////////////////////////
 
-
-void InitAsync_Webserver(){
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi..");
-  }
-
-  // Print ESP32 Local IP Address
-  Serial.println(WiFi.localIP());
-  pinMode(ledpin2, OUTPUT);     // initialize LED pin 2 as an output:
-  ledState = HIGH;
-  digitalWrite(ledpin2, ledState);  // turn on the onboard LED when wifi is connected 
+void initWebServer() {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
-  // Route for root / web page  This function is the main page, as well as the Zoffsetdown button call function
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    readZoffsetdown();
-    request->send_P(200, "text/html", index_html, processor);
-  });
-    server.on("/speed", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readSpeed().c_str());
-  });
-    server.on("/distance", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readDistance().c_str());
-  });
-  server.on("/rpm", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readRpm().c_str());
-  });
-    server.on("/hour", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readHour().c_str());
-  });
-    server.on("/minute", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readMinute().c_str());
-  });
-    server.on("/second", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readSecond().c_str());
-  });
-    server.on("/zoffset", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readZoffset().c_str());
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println();
+    Serial.printf("WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
     
-  });
-    server.on("/totalrevcount", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/plain", readTotalrevcount().c_str());
-  });
-    // Send a GET request to <IP>/sensor/<number>/action/<action>
-    server.on("/zoffsetup", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    readZoffsetup();
-    request->send_P(200, "text/html", index_html, processor);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);  // LED on when connected
+    
+    // Main page
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send_P(200, "text/html", HTML_TEMPLATE, processTemplate);
     });
-    // Send a GET request to <IP>/sensor/<number>/action/<action>
-    server.on("/reset", HTTP_GET, [] (AsyncWebServerRequest *request) {
-    readReset();
-    request->send_P(200, "text/html", index_html, processor);
-    }); 
-  //server.on("/humidity", HTTP_GET, [](AsyncWebServerRequest *request){
-  //  request->send_P(200, "text/plain", readDHTHumidity().c_str());
-  //});
-
-  // Start server
-  server.begin();
+    
+    // API endpoints
+    server.on("/api/speed", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getSpeed());
+    });
+    server.on("/api/distance", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getDistance());
+    });
+    server.on("/api/rpm", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getRPM());
+    });
+    server.on("/api/hour", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getHour());
+    });
+    server.on("/api/minute", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getMinute());
+    });
+    server.on("/api/second", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getSecond());
+    });
+    server.on("/api/offset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getOffset());
+    });
+    server.on("/api/revs", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/plain", getTotalRevs());
+    });
+    
+    // Control endpoints
+    server.on("/offset/up", HTTP_GET, [](AsyncWebServerRequest *request) {
+        adjustOffsetUp();
+        request->send_P(200, "text/html", HTML_TEMPLATE, processTemplate);
+    });
+    server.on("/offset/down", HTTP_GET, [](AsyncWebServerRequest *request) {
+        adjustOffsetDown();
+        request->send_P(200, "text/html", HTML_TEMPLATE, processTemplate);
+    });
+    server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        resetWorkout();
+        request->send_P(200, "text/html", HTML_TEMPLATE, processTemplate);
+    });
+    
+    server.begin();
+    Serial.println("Web server started");
 }
 
-void Calculate_RPM(){
-   // divide number of microseconds in a minute, by the average interval.
-    if (revCount > 0){    //confirm there was at least one spin in the last second
-      // rpmaccumulatorInterval = 60000000/(accumulatorInterval/revCount);
-      rpm = 60000000/(accumulatorInterval/revCount);
-      
-      accumulatorInterval = 0;
-
-      //Test = Calculate average from last 4 rpms - response too slow
-      accumulator4 -= (accumulator4 >> 2);
-      accumulator4 += rpm;
-    }
-    else{
-      rpm = 0;
-      rpmaccumulatorInterval=0;
-      accumulator4 = 0;  //average rpm of last 4 samples
-    }
-    revCount = 0;   
-}
-void SerialMonitor_Run_Metrics() {
-    Serial.print("RPM:"); Serial.print(int(rpm));
-    Serial.print("  Speed(MPS):"); 
-    //Treadmill belt was measured in mm.    Speed =mm/rev * rev/min * min/secs * meters/mm = meters/secs
-    mps = belt_distance*(rpm)/(60*1000);
-    Serial.print(mps);    //mps
-    Serial.print("  Speed(KPH):");  Serial.print(mps*3.6);  
-    Serial.print("  Distance:");  Serial.print(workout_distance/1000);  Serial.print("m  ");
-    Serial.print("  Timer:"); Serial.print(hour()); Serial.print(":");Serial.print(minute());Serial.print(":");Serial.print(second());
-    Serial.print("  mpsOffset:");     Serial.print(mpsOffset); 
-    //Serial.print("  t_rpmaccum:"); Serial.print(int(rpmaccumulatorInterval));
-    //Serial.print("  t_speed(KPH):"); Serial.println(3.6*belt_distance*(rpmaccumulatorInterval)/(60*1000));
-    Serial.print("  t_speed(KPH):"); Serial.println(round(10*3.6*belt_distance*(accumulator4/4)/(60*1000))/10);  //rounded, not used anywhere else
- 
-    }
-
- void send_BLE(){
-  inst_speed = (mps+mpsOffset)*256;            //formated for BLE
-  total_distance = (workout_distance/100);  //formated for BLE
-  ///Taco Stuff 3 end
-  //Create the bytearray to send to Zwift via BLE
-  byte charArray[10] = {
-      3,
-      (unsigned byte)inst_speed, (unsigned byte)(inst_speed >> 8),
-      (unsigned byte)inst_cadence,
-      (unsigned byte)inst_stride_length, (unsigned byte)(inst_stride_length >> 8),
-      (unsigned byte)total_distance, (unsigned byte)(total_distance >> 8), (unsigned byte)(total_distance >> 16), (unsigned byte)(total_distance >> 24)};
-
-  RSCMeasurementCharacteristics.setValue(charArray,10);
-  RSCMeasurementCharacteristics.notify();
-  sensorPositionCharacteristic.setValue(fakePos, 1);
+void initTachometer() {
+    pinMode(INTERRUPT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), tachInterrupt, FALLING);
+    setTime(0, 0, 0, 0, 0, 0);
+    Serial.println("Tachometer initialized");
 }
 
+void printMetrics() {
+    Serial.printf("RPM: %d | Speed: %.1f km/h | Distance: %.0fm | Time: %02d:%02d:%02d | Offset: %.1f km/h\n",
+        (int)metrics.rpm,
+        metrics.mps * 3.6,
+        metrics.workoutDistance / 1000.0,
+        hour(), minute(), second(),
+        metrics.mpsOffset * 3.6
+    );
+}
+
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi disconnected, reconnecting...");
+        digitalWrite(LED_PIN, LOW);
+        WiFi.reconnect();
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            Serial.print(".");
+        }
+        digitalWrite(LED_PIN, HIGH);
+        Serial.println("\nWiFi reconnected");
+    }
+}
+
+// ============================================================================
+// MAIN FUNCTIONS
+// ============================================================================
 void setup() {
-  // initialize the LED pin as an output:
-  //pinMode(ledPin, OUTPUT);
-  // initialize the Serial Monitor @ 9600
-  Serial.begin(115200);
-  
-  Serial.println("RESET");
-  InitBLE();
-  InitTacho();
-  InitAsync_Webserver();
-  delay(2000);
+    Serial.begin(115200);
+    Serial.println("\n=== Treadmill Monitor Starting ===");
+    
+    initBLE();
+    initTachometer();
+    initWebServer();
+    
+    metrics.lastUpdate = millis();
+    
+    Serial.println("=== Setup Complete ===\n");
 }
 
-void loop(){
-   if (millis() - lastUpdate > 1000){
-    lastUpdate = millis();
-    Calculate_RPM();
-    SerialMonitor_Run_Metrics();
-   send_BLE();
-
-
-// Connect to Wi-Fi
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-  }
- } 
+void loop() {
+    unsigned long currentTime = millis();
+    
+    // Update metrics every second
+    if (currentTime - metrics.lastUpdate >= DISPLAY_UPDATE_INTERVAL) {
+        metrics.lastUpdate = currentTime;
+        
+        updateMetrics();
+        printMetrics();
+        sendBLEData();
+        checkWiFiConnection();
+    }
+    
+    // Small delay to prevent excessive CPU usage
+    delay(10);
 }
