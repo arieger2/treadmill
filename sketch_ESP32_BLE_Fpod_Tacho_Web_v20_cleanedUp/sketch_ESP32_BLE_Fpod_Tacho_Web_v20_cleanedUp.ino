@@ -428,7 +428,7 @@ void calculateRPM() {
     
     if (metrics.revCount > 0 && metrics.accumulatorInterval !=0) {
         metrics.rpm = 60000000.0 / (metrics.accumulatorInterval / metrics.revCount);
-        metrics.sensorPulsPerSecond = (metrics.revCount * 60 *1000000) / metrics.accumulatorInterval; // 1 Second
+        metrics.sensorPulsPerSecond = (metrics.revCount * 60 *100000) / metrics.accumulatorInterval; // 1 Second
         metrics.accumulatorInterval = 0;
         lastValidRPMTime = currentTime;
         metrics.revCount = 0;
