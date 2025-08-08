@@ -16,7 +16,7 @@ const char* WIFI_SSID = "chicago";
 const char* WIFI_PASSWORD = "Neukirch20211!";
 const int MAX_WIFI_RECONNECT_TRY = 2;
 const char* BLE_DEVICE_NAME = "Rieger_Treatmill";
-const bool enableRSC = false;
+const bool enableRSC = true;
 
 
 // Hardware pins
@@ -28,11 +28,11 @@ const long BELT_DISTANCE_MM = 191;  // Belt distance per revolution in mm
 const long DEBOUNCE_THRESHOLD_US = 30;  // Minimum time between valid interrupts
 const long MAX_REVOLUTION_TIME_US = 1000000;  // Max time for valid revolution (1 second)
 
-// DUAL BLE SERVICES - RSC for data + FTMS for control
-//#define RSC_SERVICE_UUID BLEUUID((uint16_t)0x1814)
-//#define RSC_MEASUREMENT_UUID BLEUUID((uint16_t)0x2A53)
-//#define SENSOR_POSITION_UUID BLEUUID((uint16_t)0x2A5D)
-
+// DUAL BLE SERVICES - RSC for data for control
+#define RSC_SERVICE_UUID BLEUUID((uint16_t)0x1814)
+#define RSC_MEASUREMENT_UUID BLEUUID((uint16_t)0x2A53)
+#define SENSOR_POSITION_UUID BLEUUID((uint16_t)0x2A5D)
+// DUAL BLE SERVICES -  FTMS for control
 #define FTMS_SERVICE_UUID BLEUUID((uint16_t)0x1826)
 #define FTMS_FEATURE_UUID BLEUUID((uint16_t)0x2ACC)
 #define TREADMILL_DATA_UUID BLEUUID((uint16_t)0x2ACD)
@@ -93,7 +93,7 @@ struct BLEData {
     bool clientConnected = false;
     uint16_t instSpeed = 0;
     uint8_t instCadence = 85;
-    uint16_t instStrideLength = 1200;
+    uint16_t instStrideLength = 80;
     uint32_t totalDistance = 0;
     byte fakePos[1] = {1};
 };
@@ -104,8 +104,8 @@ BLEData bleData;
 // DUAL BLE objects
 BLEServer* pServer = nullptr;
 // RSC characteristics
-//BLECharacteristic* pRSCMeasurement = nullptr;
-//BLECharacteristic* pSensorPosition = nullptr;
+BLECharacteristic* pRSCMeasurement = nullptr;
+BLECharacteristic* pSensorPosition = nullptr;
 // FTMS characteristics
 BLECharacteristic* pFTMSTreadmillData = nullptr;
 BLECharacteristic* pFTMSControlPoint = nullptr;
@@ -293,8 +293,8 @@ class FTMSControlPointCallbacks : public BLECharacteristicCallbacks {
                     float adjustment = (speedKmh - currentSpeedKmh) / 3.6;
                     metrics.mpsOffset += adjustment;
                     
-                    //Serial.printf("Speed adjusted: Current %.1f -> Target %.1f (Offset: %.1f km/h)\n", 
-                    //              currentSpeedKmh, speedKmh, metrics.mpsOffset * 3.6);
+                    Serial.printf("Speed adjusted: Current %.1f -> Target %.1f (Offset: %.1f km/h)\n", 
+                                  currentSpeedKmh, speedKmh, metrics.mpsOffset * 3.6);
                 } else {
                     response[2] = FTMS_INVALID_PARAMETER;
                 }
@@ -383,7 +383,6 @@ class ServerCallbacks : public BLEServerCallbacks {
 // ============================================================================
 // ALTERNATIVE: Monitor CCCD writes to know when notifications are enabled
 // ============================================================================
-
 // Optional: Custom CCCD callback to track when client enables/disables notifications
 class CCCDCallbacks : public BLEDescriptorCallbacks {
     void onWrite(BLEDescriptor* pDescriptor) override {
@@ -407,140 +406,40 @@ class CCCDCallbacks : public BLEDescriptorCallbacks {
     }
 };
 
-/*
-void initBLE() {
-    Serial.println("Initializing BLE...");
+void initBLE_RSC() {
+    // must be after the FTMS initalisation !!!!!!!!!
+    Serial.println("Initializing BLE for RSC...");
 
     try {
-        BLEDevice::init(BLE_DEVICE_NAME);
-        
-        pServer = BLEDevice::createServer();
-        if (!pServer) {
-            Serial.println("Failed to create BLE server");
-            return;
-        }
-        
-        pServer->setCallbacks(new ServerCallbacks());
-    
-        if (enableRSC) {
+        if (enableRSC && pServer) {
             // ========== RSC SERVICE ==========
             BLEService* pRSCService = pServer->createService(RSC_SERVICE_UUID);
             
+            // RSC Measurement Characteristic
             pRSCMeasurement = pRSCService->createCharacteristic(
                 RSC_MEASUREMENT_UUID,
                 BLECharacteristic::PROPERTY_NOTIFY
             );
+            pRSCMeasurement->addDescriptor(new BLE2902());
             
-            // EXPLICIT CCCD setup for RSC Measurement
-            BLE2902* rscDescriptor = new BLE2902();
-            rscDescriptor->setNotifications(true);
-            rscDescriptor->setIndications(false);
-            pRSCMeasurement->addDescriptor(rscDescriptor);
-            Serial.println("✅ Added CCCD to RSC Measurement");
-            
+            // Sensor Position Characteristic
             pSensorPosition = pRSCService->createCharacteristic(
                 SENSOR_POSITION_UUID,
                 BLECharacteristic::PROPERTY_READ
             );
             
             pRSCService->start();
-            Serial.println("✅ RSC Service started");
-        }
-    
-        // ========== FTMS SERVICE ==========
-        BLEService* pFTMSService = pServer->createService(FTMS_SERVICE_UUID);
-        
-        // FTMS Feature
-        pFTMSFeature = pFTMSService->createCharacteristic(
-            FTMS_FEATURE_UUID,
-            BLECharacteristic::PROPERTY_READ
-        );
-        
-        uint32_t ftmsFeatures = 
-            (1 << 0) |  // Average Speed Supported
-            (1 << 1) |  // Total Distance Supported
-            (1 << 2) |  // Instantaneous Cadence Supported (ADDED FOR CADENCE)
-            (1 << 3) |  // Inclination Supported
-            (1 << 8) |  // Target Speed Supported
-            (1 << 9) |  // Target Inclination Supported
-            (1 << 18);  // Heart Rate Target Supported
-
-        uint64_t ftmsFeatures64 = ftmsFeatures; // Safe extension to 64-bit
-
-        pFTMSFeature->setValue((uint8_t*)&ftmsFeatures64, 8);
-        
-        // FTMS Treadmill Data
-        pFTMSTreadmillData = pFTMSService->createCharacteristic(
-            TREADMILL_DATA_UUID,
-            BLECharacteristic::PROPERTY_NOTIFY
-        );
-        
-        // EXPLICIT CCCD setup for FTMS Treadmill Data
-        BLE2902* ftmsDataDescriptor = new BLE2902();
-        ftmsDataDescriptor->setNotifications(true);
-        ftmsDataDescriptor->setIndications(false);
-        pFTMSTreadmillData->addDescriptor(ftmsDataDescriptor);
-        Serial.println("✅ Added CCCD to FTMS Treadmill Data");
-        
-        // FTMS Control Point
-        pFTMSControlPoint = pFTMSService->createCharacteristic(
-            FTMS_CONTROL_POINT_UUID,
-            BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_INDICATE
-        );
-        BLE2902* cpDescriptor = new BLE2902();
-        cpDescriptor->setIndications(true);
-        cpDescriptor->setNotifications(false);
-        cpDescriptor->setCallbacks(new CCCDCallbacks()); // Add callback to monitor
-        pFTMSControlPoint->addDescriptor(cpDescriptor);
-        pFTMSControlPoint->setCallbacks(new FTMSControlPointCallbacks());
-        Serial.println("✅ Added CCCD to FTMS Control Point");
-        
-        // FTMS Status
-        pFTMSStatus = pFTMSService->createCharacteristic(
-            FTMS_STATUS_UUID,
-            BLECharacteristic::PROPERTY_NOTIFY
-        );
-        BLE2902* statusDescriptor = new BLE2902();
-        statusDescriptor->setNotifications(true);
-        statusDescriptor->setIndications(false);
-        statusDescriptor->setCallbacks(new CCCDCallbacks()); // Add callback to monitor
-        pFTMSStatus->addDescriptor(statusDescriptor);
-        Serial.println("✅ Added CCCD to FTMS Status");
-
-        pFTMSService->start();
-        Serial.println("✅ FTMS Service started");
-        
-        // Start advertising
-        BLEAdvertising* pAdvertising = pServer->getAdvertising();
-        if (enableRSC) { pAdvertising->addServiceUUID(RSC_SERVICE_UUID)};
-        pAdvertising->addServiceUUID(FTMS_SERVICE_UUID);
-        pAdvertising->setScanResponse(true);
-
-        BLEAdvertisementData advData;
-        advData.setName("Horizon Elite T507");
-        advData.setCompleteServices(BLEUUID((uint16_t)0x1826));
-
-        pAdvertising->setAdvertisementData(advData);
-
-        BLEAdvertisementData scanResp;
-        if (enableRSC) { scanResp.setCompleteServices(BLEUUID(RSC_SERVICE_UUID))};
-        pAdvertising->setScanResponseData(scanResp);
-
-        pAdvertising->start();
-        
-        Serial.println("🚀 DUAL BLE SERVICES STARTED:");
-        Serial.println("   RSC (0x1814) - Data transmission");
-        Serial.println("   FTMS (0x1826) - Training control");
-        Serial.println("✅ BLE initialization complete with explicit CCCD setup");
-        
+            //pServer->getAdvertising()->addServiceUUID(RSC_SERVICE_UUID);
+            //pServer->getAdvertising()->start();
+            
+            Serial.println("RSC BLE service started - Compatible with MyWoosh/Zwift");
+        } // ← THIS CLOSING BRACE WAS MISSING
     } catch (const std::exception& e) {
-        Serial.printf("❌ BLE initialization failed: %s\n", e.what());
+        Serial.printf("❌ RSC BLE initialization failed: %s\n", e.what());
     } catch (...) {
-        Serial.println("❌ BLE initialization failed with unknown error");
+        Serial.println("❌ RSC BLE initialization failed with unknown error");
     }
-}
-*/
-
+} 
 
 void initFTMS_BLE() {
     Serial.println("Initializing BLE...");
@@ -713,254 +612,61 @@ void initFTMS_BLE() {
     }
 }
 
-/*
-void initBLE_Simple() {
-    Serial.println("Initializing BLE (Simple Version)...");
-
-    try {
-        BLEDevice::init(BLE_DEVICE_NAME);
-        
-        pServer = BLEDevice::createServer();
-        if (!pServer) {
-            Serial.println("Failed to create BLE server");
-            return;
-        }
-        
-        pServer->setCallbacks(new ServerCallbacks());
+void sendRSC_BLE_Data() {
+    if ( !pRSCMeasurement) {
+        Serial.println("RSC Data NOT sent - Client disconnected or characteristic null");
+        return;
+    }
     
-        // ========== FTMS SERVICE ==========
-        BLEService* pFTMSService = pServer->createService(FTMS_SERVICE_UUID);
+    // RSC CADENCE-ONLY DATA (FTMS handles speed separately)
+    // MAIN FOCUS: Calculate cadence from treadmill belt RPM
+    float stepsPerMinute = metrics.rpm * 2.0; // 2 steps per belt revolution
+    bleData.instCadence = (uint8_t)(stepsPerMinute > 255 ? 255 : stepsPerMinute);
+    
+    // Minimal RSC fields (apps ignore these since FTMS provides real data)
+    bleData.instSpeed = 256; // Minimal speed (apps use FTMS speed instead)
+    bleData.totalDistance = 0; // No distance (apps use FTMS distance instead)
+    bleData.instStrideLength = 800; // ~80cm average stride length
+/*
+        bleData.instSpeed = (metrics.mps + metrics.mpsOffset) * 256;
+        bleData.totalDistance = metrics.workoutDistance / 100;
         
-        // FTMS Feature
-        pFTMSFeature = pFTMSService->createCharacteristic(
-            FTMS_FEATURE_UUID,
-            BLECharacteristic::PROPERTY_READ
-        );
-        
-        uint32_t ftmsFeatures = 
-            (1 << 0) |  // Average Speed Supported
-            (1 << 1) |  // Total Distance Supported
-            (1 << 3) |  // Inclination Supported
-            (1 << 8) |  // Target Speed Supported
-            (1 << 9) |  // Target Inclination Supported
-            (1 << 18);  // Heart Rate Target Supported
-
-        pFTMSFeature->setValue((uint8_t*)&ftmsFeatures, 4);
-        
-        // FTMS Treadmill Data - SIMPLIFIED
-        pFTMSTreadmillData = pFTMSService->createCharacteristic(
-            TREADMILL_DATA_UUID,
-            BLECharacteristic::PROPERTY_NOTIFY
-        );
-        
-        // Try the old way
-        pFTMSTreadmillData->addDescriptor(new BLE2902());
-        Serial.println("✅ FTMS Treadmill Data - added basic BLE2902");
-        
-        // FTMS Control Point
-        pFTMSControlPoint = pFTMSService->createCharacteristic(
-            FTMS_CONTROL_POINT_UUID,
-            BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_INDICATE
-        );
-        pFTMSControlPoint->addDescriptor(new BLE2902());
-        pFTMSControlPoint->setCallbacks(new FTMSControlPointCallbacks());
-        Serial.println("✅ FTMS Control Point - added basic BLE2902");
-        
-        // FTMS Status
-        pFTMSStatus = pFTMSService->createCharacteristic(
-            FTMS_STATUS_UUID,
-            BLECharacteristic::PROPERTY_NOTIFY
-        );
-        pFTMSStatus->addDescriptor(new BLE2902());
-        Serial.println("✅ FTMS Status - added basic BLE2902");
-
-        pFTMSService->start();
-        
-        // Start advertising
-        BLEAdvertising* pAdvertising = pServer->getAdvertising();
-        pAdvertising->addServiceUUID(RSC_SERVICE_UUID);
-        pAdvertising->addServiceUUID(FTMS_SERVICE_UUID);
-        pAdvertising->setScanResponse(true);
-
-        BLEAdvertisementData advData;
-        advData.setName("Horizon Elite T507");
-        advData.setCompleteServices(BLEUUID((uint16_t)0x1826));
-
-        pAdvertising->setAdvertisementData(advData);
-
-        BLEAdvertisementData scanResp;
-        scanResp.setCompleteServices(BLEUUID(RSC_SERVICE_UUID));
-        pAdvertising->setScanResponseData(scanResp);
-
-        pAdvertising->start();
-        
-        Serial.println("✅ BLE initialization complete (simple version)");
-        
-    } catch (const std::exception& e) {
-        Serial.printf("❌ BLE initialization failed: %s\n", e.what());
-    } catch (...) {
-        Serial.println("❌ BLE initialization failed with unknown error");
+        byte dataPacket[10] = {
+            3,  // Flags
+            (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),
+            bleData.instCadence,
+            (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8),
+            (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),
+            (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24)
+        };
+*/  
+    byte dataPacket[10] = {
+        3,  // Flags: stride length + distance present (minimal required)
+        (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),    // Minimal (ignored by apps)
+        bleData.instCadence,                                        // CADENCE - THE ONLY IMPORTANT FIELD
+        (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8), // Stride
+        (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),        // Minimal (ignored)
+        (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24) // Minimal (ignored)
+    };
+    
+    pRSCMeasurement->setValue(dataPacket, 10);
+    pRSCMeasurement->notify();
+    pSensorPosition->setValue(bleData.fakePos, 1);
+    
+    // Debug output focused on cadence only
+    static int cadenceDebugCount = 0;
+    if (++cadenceDebugCount % 40 == 0) { // Every 20 seconds
+        Serial.printf("✅ RSC Cadence ONLY: %.0f spm (belt RPM: %.1f) - FTMS handles speed/distance\n", 
+                    stepsPerMinute, metrics.rpm);
+        Serial.println();
     }
 }
-*/
 
-/*
-void sendBLEData() {
+void sendFTMS_BLE_Data() {
     if (!bleData.clientConnected) return;
 
-    
-    // ========== SEND RSC DATA ==========
-    if (pRSCMeasurement) {
-        // Use fallback version for debugging
-        bool canSendRSC = isNotificationEnabled(pRSCMeasurement);
-        
-        if (canSendRSC) {
-            bleData.instSpeed = (metrics.mps + metrics.mpsOffset) * 256;
-            bleData.totalDistance = metrics.workoutDistance / 100;
-            
-            byte dataPacket[10] = {
-                3,  // Flags
-                (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),
-                bleData.instCadence,
-                (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8),
-                (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),
-                (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24)
-            };
-            
-            try {
-                pRSCMeasurement->setValue(dataPacket, 10);
-                pRSCMeasurement->notify();
-                pSensorPosition->setValue(bleData.fakePos, 1);
-                
-                // Success feedback
-                static int successCount = 0;
-                if (++successCount % 20 == 0) { // Every 10 seconds
-                    Serial.printf("✅ RSC data sent successfully (%d times)\n", successCount);
-                    Serial.println();
-                }
-            } catch (const std::exception& e) {
-                Serial.printf("❌ RSC notify failed: %s\n", e.what());
-                Serial.println();
-            } catch (...) {
-                Serial.println("❌ RSC notify failed with unknown error");
-                Serial.println();
-            }
-        }
-    }
-    
-
-    // ========== SEND FTMS DATA ==========
-    if (pFTMSTreadmillData && metrics.controlRequested) {
-        if (isNotificationEnabled(pFTMSTreadmillData)) {
-            // Your existing FTMS data building code...
-            uint8_t ftmsData[20] = {0};
-            size_t index = 0;
-            const size_t MAX_FTMS_SIZE = 20;
-
-            // CRITICAL FIX: Correct FTMS Treadmill Data flags according to FTMS spec
-            // The flags must match EXACTLY what data is present and in correct order
-            uint16_t flags = 0x0000;
-            
-            // Only set flags for data we're actually including
-            flags |= 0x0001; // More Data bit (bit 0) - ALWAYS set when more fields present
-            flags |= 0x0002; // Average Speed Present (bit 1)
-            flags |= 0x0004; // Total Distance Present (bit 2) 
-            flags |= 0x0008; // Instantaneous Cadence Present (bit 3) - NEW FOR CADENCE
-            flags |= 0x0020; // Inclination Present (bit 5)
-            flags |= 0x0040; // Elapsed Time Present (bit 6)
-            
-            // Pack flags (2 bytes)
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                ftmsData[index++] = flags & 0xFF;
-                ftmsData[index++] = (flags >> 8) & 0xFF;
-            }
-
-            // IMPORTANT: Data fields must appear in the EXACT order specified by FTMS
-            
-            // 1. Instantaneous Speed (always present, 2 bytes, 0.01 km/h resolution)
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                float speedKmh = (metrics.mps + metrics.mpsOffset) * 3.6;
-                uint16_t speed = (uint16_t)(speedKmh * 100); // Convert to 0.01 km/h units
-                ftmsData[index++] = speed & 0xFF;
-                ftmsData[index++] = (speed >> 8) & 0xFF;
-            }
-            
-            // 2. Average Speed (if bit 1 set, 2 bytes, 0.01 km/h resolution)
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                float avgSpeedKmh = (metrics.mps + metrics.mpsOffset) * 3.6;
-                uint16_t avgSpeed = (uint16_t)(avgSpeedKmh * 100);
-                ftmsData[index++] = avgSpeed & 0xFF;
-                ftmsData[index++] = (avgSpeed >> 8) & 0xFF;
-            }
-            
-            // 3. Total Distance (if bit 2 set, 3 bytes, 1m resolution)
-            if (index + 3 <= MAX_FTMS_SIZE) {
-                uint32_t distanceM = metrics.workoutDistance / 1000; // Convert mm to m
-                ftmsData[index++] = distanceM & 0xFF;
-                ftmsData[index++] = (distanceM >> 8) & 0xFF;
-                ftmsData[index++] = (distanceM >> 16) & 0xFF;
-            }
-            
-            // 4. Instantaneous Cadence (if bit 3 set, 2 bytes, 0.5 steps/min resolution)
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                // Calculate cadence: Belt RPM → Steps per minute
-                // Assumption: 2 steps per belt revolution for typical treadmill gait
-                float cadenceSteps = metrics.rpm * 2.0;
-                uint16_t cadenceFormatted = (uint16_t)(cadenceSteps * 2); // Convert to 0.5 steps/min units
-                ftmsData[index++] = cadenceFormatted & 0xFF;
-                ftmsData[index++] = (cadenceFormatted >> 8) & 0xFF;
-            }
-            
-            // Skip bits 4 (Stride Length) - not setting this flag
-            
-            // 5. Inclination (if bit 5 set, 2 bytes, 0.1% resolution)  
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                int16_t incline = (int16_t)(metrics.currentInclination * 10); // Convert to 0.1% units
-                ftmsData[index++] = incline & 0xFF;
-                ftmsData[index++] = (incline >> 8) & 0xFF;
-            }
-            
-            // 6. Elapsed Time (if bit 6 set, 2 bytes, 1s resolution)
-            if (index + 2 <= MAX_FTMS_SIZE) {
-                uint16_t elapsedSeconds = (millis() - metrics.sessionStartTime) / 1000;
-                ftmsData[index++] = elapsedSeconds & 0xFF;
-                ftmsData[index++] = (elapsedSeconds >> 8) & 0xFF;
-            }
-            
-            if (index <= MAX_FTMS_SIZE && index > 0) {
-                try {
-                    pFTMSTreadmillData->setValue(ftmsData, index);
-                    pFTMSTreadmillData->notify();
-                
-                    // Success feedback
-                    static int successCount = 0;
-                    if (++successCount % 20 == 0) { // Every 10 seconds
-                        Serial.printf("✅ FTMS data sent successfully (%d times)\n", successCount);
-                        Serial.println();
-                    }
-                } catch (const std::exception& e) {
-                    Serial.printf("❌ FTMS notify failed: %s\n", e.what());
-                } catch (...) {
-                    Serial.println("❌ FTMS notify failed with unknown error");
-                }
-            }
-        } else {
-            static int notEnabledCount = 0;
-            if (++notEnabledCount % 200 == 0) { // Reduce notification spam
-                Serial.println("⚠️ FTMS Notifications not enabled by client yet");
-            }
-        }
-    } else {
-        static int noControlCount = 0;
-        if (++noControlCount % 200 == 0) { // Reduce spam
-            Serial.println("⚠️ FTMS Control not requested by client yet");
-        }
-    }
-}
-*/
-
-void sendBLEData() {
-    if (!bleData.clientConnected) return;
+    // ========== SEND FTMS TREADMILL DATA ==========
+    sendRSC_BLE_Data();
     
     // ========== SEND FTMS TREADMILL DATA ==========
     if (pFTMSTreadmillData && metrics.controlRequested) {
@@ -1038,9 +744,12 @@ void sendBLEData() {
                     if (++successCount % 20 == 0) { // Every 10 seconds
                         Serial.printf("✅ TREADMILL FTMS: Speed=%.1fkm/h, Distance=%dm\n", 
                                     speedKmh, (int)totalDistance);
+                        Serial.println();
                         Serial.printf("    Incline=%.1f%%, Time=%ds, Flags=0x%04X, Size=%d bytes (%d)\n", 
                                     metrics.currentInclination, elapsedTime, flags, index, successCount);
+                        Serial.println();
                         Serial.printf("    NOTE: Cadence=%.0f spm not sent (not in treadmill FTMS spec)\n", stepsPerMinute);
+                        Serial.println();
                         
                         // Debug hex dump for troubleshooting
                         if (successCount <= 60) { // First 30 seconds
@@ -1399,7 +1108,7 @@ void setup() {
     
     //initBLE();
     initFTMS_BLE();
-    //initBLE_Simple();
+    initBLE_RSC();
     initTachometer();
     initWebServer();
     
@@ -1421,22 +1130,6 @@ void generateTestData() {
     static unsigned long lastTestTime = 0;
     unsigned long currentTime = millis();
     tachInterrupt();
-    /*
-    // Generate test data every second when running
-    if (metrics.isRunning && (currentTime - lastTestTime > 1000)) {
-        // Simulate 5 km/h constant speed
-        metrics.mps = 1.39; // 5 km/h in m/s
-        metrics.rpm = 44;   // Approximate RPM for 5 km/h
-        
-        // Add distance
-        if (metrics.workoutDistance < LONG_MAX - 1390) {
-            metrics.workoutDistance += 1390; // Add ~1.39 meters (5 km/h for 1 second)
-        }
-        
-        lastTestTime = currentTime;
-        Serial.println("🧪 Generated test data: 5 km/h, distance updated");
-    }
-    */
 }
 
 void loop() {
@@ -1478,7 +1171,7 @@ void loop() {
 
         // Send BLE data more frequently when client connected
         if (bleData.clientConnected) {
-            sendBLEData();
+            sendFTMS_BLE_Data();
             
             // Debug output every few seconds
             static int debugCounter = 0;
