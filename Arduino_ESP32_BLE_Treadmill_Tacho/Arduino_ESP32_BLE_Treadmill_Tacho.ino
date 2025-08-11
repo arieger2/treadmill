@@ -6,6 +6,7 @@
 #include <Wire.h>
 #include <TimeLib.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <ESPAsyncWebServer.h>
 #include <math.h>
 
@@ -118,7 +119,6 @@ BLECharacteristic* pFTMSSupportedInclinationRange = nullptr;
 
 
 AsyncWebServer server(80);
-
 // ============================================================================
 // INTERRUPT HANDLER
 // ============================================================================
@@ -548,7 +548,7 @@ void initFTMS_BLE() {
         uint32_t ftmsFeatures = 
             (1 << 0) |  // Average Speed Supported
             (1 << 1) |  // Total Distance Supported
-            (1 << 2) |  // Instantaneous Cadence Supported (ADDED FOR CADENCE)
+            //(1 << 2) |  // Instantaneous Cadence Supported (ADDED FOR CADENCE)
             (1 << 3) |  // Inclination Supported
             (1 << 8) |  // Target Speed Supported
             (1 << 9) |  // Target Inclination Supported
@@ -979,12 +979,30 @@ String processTemplate(const String& var) {
 }
 
 void initWebServer() {
+    WiFi.setSleep(false);                             // keep Wi-Fi awake for stable web + BLE coexistence
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);              // strongest legal TX power
+
+    wifi_country_t ctry = { "DE", 1, 13, WIFI_COUNTRY_POLICY_MANUAL };   // EU: 1–13
+    esp_wifi_set_country(&ctry);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);                   // avoid 40MHz quirks
+
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);                               // don’t hammer NVS
+    WiFi.setHostname("esp32s3-treadmill");                // pick a name
+    WiFi.setAutoReconnect(true);
+
+    // lock STA to b/g/n; many home APs still expect this
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+
+    // ensure we’re not stuck with stale state
+    WiFi.disconnect(true, true);        // erase old state, keep radio on
+    delay(100);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
     Serial.print("Connecting to WiFi");
     int reconnectCont = 0;
     while (WiFi.status() != WL_CONNECTED && reconnectCont < MAX_WIFI_RECONNECT_TRY) {
-        delay(3000);
+        delay(500);                     // shorter block to reduce RF contention
         Serial.print(".");
         reconnectCont++;
     }
@@ -1091,21 +1109,27 @@ void printMetrics() {
 }
 
 void checkWiFiConnection() {
-    int reconnectCont = 0;
-    if (WiFi.status() != WL_CONNECTED ) {
-        Serial.println("WiFi disconnected, reconnecting...");
-        digitalWrite(LED_PIN, LOW);
-        WiFi.reconnect();
-        while (WiFi.status() != WL_CONNECTED && reconnectCont < MAX_WIFI_RECONNECT_TRY) {
-            delay(3000);
-            Serial.print("|");
-            reconnectCont++;
-        }
+    static unsigned long lastAttempt = 0;
+    static uint32_t backoffMs = 1000;                 // start 1s
+    const uint32_t backoffMax = 15000;                // cap 15s
 
-        if (WiFi.status() == WL_CONNECTED) {
-          digitalWrite(LED_PIN, HIGH);
-          Serial.println("\nWiFi reconnected");
-        }
+    if (WiFi.status() == WL_CONNECTED) {
+        digitalWrite(LED_PIN, HIGH);
+        backoffMs = 1000;                             // reset on success
+        return;
+    }
+
+    unsigned long now = millis();
+    if (now - lastAttempt >= backoffMs) {
+        Serial.printf("WiFi down, retry in %lu ms…\n", (unsigned long)backoffMs);
+        digitalWrite(LED_PIN, LOW);
+
+        WiFi.disconnect(true, true);                  // full clean
+        delay(50);
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+        lastAttempt = now;
+        backoffMs = min(backoffMs * 2, backoffMax);   // exponential backoff
     }
 }
 
@@ -1208,11 +1232,10 @@ void loop() {
             }
         }
         
-        static int wifiCounter = 0;
-        wifiCounter++;
-        if (wifiCounter >= 20 * DISPLAY_UPDATE_INTERVAL) {
+        static unsigned long lastWiFiTick = 0;
+        if (millis() - lastWiFiTick >= 500) {     // check every 500 ms non-blocking
+            lastWiFiTick = millis();
             checkWiFiConnection();
-            wifiCounter = 0;
         }
     }
     
