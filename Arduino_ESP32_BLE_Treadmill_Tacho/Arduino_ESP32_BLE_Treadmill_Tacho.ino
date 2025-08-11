@@ -14,9 +14,8 @@
 // ============================================================================
 const char* WIFI_SSID = "chicago";
 const char* WIFI_PASSWORD = "Neukirch20211!";
-const int MAX_WIFI_RECONNECT_TRY = 2;
+const int MAX_WIFI_RECONNECT_TRY = 5;
 const char* BLE_DEVICE_NAME = "Rieger_Treatmill";
-const bool enableRSC = true;
 
 
 // Hardware pins
@@ -32,6 +31,7 @@ const long MAX_REVOLUTION_TIME_US = 1000000;  // Max time for valid revolution (
 #define RSC_SERVICE_UUID BLEUUID((uint16_t)0x1814)
 #define RSC_MEASUREMENT_UUID BLEUUID((uint16_t)0x2A53)
 #define SENSOR_POSITION_UUID BLEUUID((uint16_t)0x2A5D)
+#define RSC_FEATURE_UUID BLEUUID((uint16_t)0x2A54)
 // DUAL BLE SERVICES -  FTMS for control
 #define FTMS_SERVICE_UUID BLEUUID((uint16_t)0x1826)
 #define FTMS_FEATURE_UUID BLEUUID((uint16_t)0x2ACC)
@@ -105,6 +105,7 @@ BLEData bleData;
 BLEServer* pServer = nullptr;
 // RSC characteristics
 BLECharacteristic* pRSCMeasurement = nullptr;
+//BLECharacteristic* pRSCFeatures = nullptr;
 BLECharacteristic* pSensorPosition = nullptr;
 // FTMS characteristics
 BLECharacteristic* pFTMSTreadmillData = nullptr;
@@ -192,6 +193,19 @@ bool isNotificationEnabled(BLECharacteristic* characteristic) {
     return bleData.clientConnected;
 }
 
+bool isRSCNotificationEnabled() {
+    if (!pRSCMeasurement || !bleData.clientConnected) return false;
+    
+    try {
+        BLEDescriptor* cccd = pRSCMeasurement->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+        if (cccd && cccd->getLength() >= 2) {
+            uint8_t* value = cccd->getValue();
+            uint16_t cccdValue = value[0] | (value[1] << 8);
+            return (cccdValue & 0x0001) != 0;
+        }
+    } catch (...) {}
+    return false;
+}
 
 void sendFTMSStatusUpdate(uint8_t statusCode) {
     if (!bleData.clientConnected || !pFTMSStatus) {
@@ -411,26 +425,29 @@ void initBLE_RSC() {
     Serial.println("Initializing BLE for RSC...");
 
     try {
-        if (enableRSC && pServer) {
+        if (pServer) {
             // ========== RSC SERVICE ==========
             BLEService* pRSCService = pServer->createService(RSC_SERVICE_UUID);
             
             // RSC Measurement Characteristic
+            // Feature characteristic (required)
+            BLECharacteristic* pFeature = pRSCService->createCharacteristic(
+                RSC_FEATURE_UUID, BLECharacteristic::PROPERTY_READ
+            );
+            uint16_t features = 0x0000; // no stride length, no distance, no status
+            pFeature->setValue((uint8_t*)&features, 2);
+
             pRSCMeasurement = pRSCService->createCharacteristic(
                 RSC_MEASUREMENT_UUID,
                 BLECharacteristic::PROPERTY_NOTIFY
             );
-            pRSCMeasurement->addDescriptor(new BLE2902());
-            
-            // Sensor Position Characteristic
-            pSensorPosition = pRSCService->createCharacteristic(
-                SENSOR_POSITION_UUID,
-                BLECharacteristic::PROPERTY_READ
-            );
+            // Add CCCD with callbacks to monitor MyWoosh connection
+            BLE2902* rscDescriptor = new BLE2902();
+            rscDescriptor->setNotifications(true);
+            rscDescriptor->setCallbacks(new CCCDCallbacks());  // Monitor notifications
+            pRSCMeasurement->addDescriptor(rscDescriptor);
             
             pRSCService->start();
-            //pServer->getAdvertising()->addServiceUUID(RSC_SERVICE_UUID);
-            //pServer->getAdvertising()->start();
             
             Serial.println("RSC BLE service started - Compatible with MyWoosh/Zwift");
         } // ← THIS CLOSING BRACE WAS MISSING
@@ -588,23 +605,41 @@ void initFTMS_BLE() {
         pFTMSService->start();
         Serial.println("✅ FTMS Service started");    
         
+    } catch (const std::exception& e) {
+        Serial.printf("❌ BLE initialization failed: %s\n", e.what());
+    } catch (...) {
+        Serial.println("❌ BLE initialization failed with unknown error");
+    }
+}
+
+void BLEAdvertising_init() {
+    try {
         // Start advertising
+        // Build advertising once both services exist
+        BLEAdvertising* pAdvertising = pServer->getAdvertising();
+        pAdvertising->stop();
+
+        // Easiest: don’t use custom BLEAdvertisementData, just add UUIDs:
+        //pAdvertising->clearData();
+
         BLEAdvertisementData advData;
+        
         advData.setName("Horizon Elite T507");
+        //advData.setCompleteServices(BLEUUID((uint16_t)0x1814));  // RSC first
         advData.setCompleteServices(BLEUUID((uint16_t)0x1826));
         advData.setFlags(0x06); // LE General Discoverable + BR/EDR not supported
+        pAdvertising->setAdvertisementData(advData);
 
-        BLEAdvertising* pAdvertising = pServer->getAdvertising();
         pAdvertising->addServiceUUID(FTMS_SERVICE_UUID);
+        pAdvertising->addServiceUUID(RSC_SERVICE_UUID);
         pAdvertising->setScanResponse(true);
         pAdvertising->setMinPreferred(0x0);
-        pAdvertising->setAdvertisementData(advData);
+
         pAdvertising->start();
         Serial.println("🚀 DUAL BLE SERVICES STARTED:");
         Serial.println("   RSC (0x1814) - Data transmission");
         Serial.println("   FTMS (0x1826) - Training control");
         Serial.println("✅ BLE initialization complete with explicit CCCD setup");
-        
     } catch (const std::exception& e) {
         Serial.printf("❌ BLE initialization failed: %s\n", e.what());
     } catch (...) {
@@ -613,49 +648,40 @@ void initFTMS_BLE() {
 }
 
 void sendRSC_BLE_Data() {
-    if ( !pRSCMeasurement) {
+    if ( !pRSCMeasurement || !bleData.clientConnected) {
         Serial.println("RSC Data NOT sent - Client disconnected or characteristic null");
         return;
     }
-    
-    // RSC CADENCE-ONLY DATA (FTMS handles speed separately)
-    // MAIN FOCUS: Calculate cadence from treadmill belt RPM
-    float stepsPerMinute = metrics.rpm * 2.0; // 2 steps per belt revolution
-    bleData.instCadence = (uint8_t)(stepsPerMinute > 255 ? 255 : stepsPerMinute);
-    
-    // Minimal RSC fields (apps ignore these since FTMS provides real data)
-    bleData.instSpeed = 256; // Minimal speed (apps use FTMS speed instead)
-    bleData.totalDistance = 0; // No distance (apps use FTMS distance instead)
-    bleData.instStrideLength = 800; // ~80cm average stride length
-/*
-        bleData.instSpeed = (metrics.mps + metrics.mpsOffset) * 256;
-        bleData.totalDistance = metrics.workoutDistance / 100;
-        
-        byte dataPacket[10] = {
-            3,  // Flags
-            (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),
-            bleData.instCadence,
-            (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8),
-            (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),
-            (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24)
-        };
-*/  
-    byte dataPacket[10] = {
-        3,  // Flags: stride length + distance present (minimal required)
-        (byte)bleData.instSpeed, (byte)(bleData.instSpeed >> 8),    // Minimal (ignored by apps)
-        bleData.instCadence,                                        // CADENCE - THE ONLY IMPORTANT FIELD
-        (byte)bleData.instStrideLength, (byte)(bleData.instStrideLength >> 8), // Stride
-        (byte)bleData.totalDistance, (byte)(bleData.totalDistance >> 8),        // Minimal (ignored)
-        (byte)(bleData.totalDistance >> 16), (byte)(bleData.totalDistance >> 24) // Minimal (ignored)
+
+    // Compute cadence
+    float stepsPerMinute = metrics.rpm * 2.0f;
+    uint8_t cadence = (stepsPerMinute > 255) ? 255 : (uint8_t)stepsPerMinute;
+
+    // Compute speed (m/s * 256), keep it consistent with FTMS
+    float mps = metrics.mps + metrics.mpsOffset;        // m/s
+    uint16_t instSpeed = (uint16_t)(mps * 256.0f);      // spec scaling
+
+    // RSC flags - include cadence
+    uint8_t flags = 0x00; //cadence is mandatory
+
+    uint8_t dataPacket[4] = {
+        flags,
+        (uint8_t)(instSpeed & 0xFF),
+        (uint8_t)(instSpeed >> 8),
+        cadence
     };
-    
-    pRSCMeasurement->setValue(dataPacket, 10);
+
+    pRSCMeasurement->setValue(dataPacket, sizeof(dataPacket));
     pRSCMeasurement->notify();
-    pSensorPosition->setValue(bleData.fakePos, 1);
     
     // Debug output focused on cadence only
     static int cadenceDebugCount = 0;
     if (++cadenceDebugCount % 40 == 0) { // Every 20 seconds
+        if(isRSCNotificationEnabled()) {
+            Serial.println("RSC Notification enabled");
+        } else {
+            Serial.println("RSC Notification not enabled, not cadence send");
+        }
         Serial.printf("✅ RSC Cadence ONLY: %.0f spm (belt RPM: %.1f) - FTMS handles speed/distance\n", 
                     stepsPerMinute, metrics.rpm);
         Serial.println();
@@ -685,11 +711,6 @@ void sendFTMS_BLE_Data() {
             uint32_t totalDistance = metrics.workoutDistance / 1000; // Convert mm to meters (1m resolution)
             int16_t inclination = (int16_t)(metrics.currentInclination * 10); // 0.1% resolution
             uint16_t elapsedTime = (millis() - metrics.sessionStartTime) / 1000; // 1s resolution
-            
-            // TREADMILL CADENCE: Steps per minute from belt RPM  
-            // For treadmills, cadence represents STEPS PER MINUTE, not pedal RPM
-            float stepsPerMinute = metrics.rpm * 2.0; // Assume 2 steps per belt revolution
-            uint16_t instantaneousCadence = (uint16_t)(stepsPerMinute * 2); // 0.5 steps/min resolution
             
             // CRITICAL FIX: Treadmill FTMS flags - cadence may not be officially supported
             // Based on real-world treadmill implementations that work with apps
@@ -741,14 +762,12 @@ void sendFTMS_BLE_Data() {
                 
                     // Enhanced debug output for treadmill-specific values
                     static int successCount = 0;
-                    if (++successCount % 20 == 0) { // Every 10 seconds
+                    if (++successCount % 40 == 0) { // Every 10 seconds
                         Serial.printf("✅ TREADMILL FTMS: Speed=%.1fkm/h, Distance=%dm\n", 
                                     speedKmh, (int)totalDistance);
                         Serial.println();
                         Serial.printf("    Incline=%.1f%%, Time=%ds, Flags=0x%04X, Size=%d bytes (%d)\n", 
                                     metrics.currentInclination, elapsedTime, flags, index, successCount);
-                        Serial.println();
-                        Serial.printf("    NOTE: Cadence=%.0f spm not sent (not in treadmill FTMS spec)\n", stepsPerMinute);
                         Serial.println();
                         
                         // Debug hex dump for troubleshooting
@@ -801,6 +820,7 @@ void calculateRPM() {
         // Nur auf 0 setzen, wenn längere Zeit keine Impulse
         if (currentTime - lastValidRPMTime > 2000) { // 2 Sekunden
             metrics.rpm = 0;
+            metrics.mpsOffset = 0;
         }
         // Sonst: letzte RPM beibehalten
     }
@@ -1109,6 +1129,7 @@ void setup() {
     //initBLE();
     initFTMS_BLE();
     initBLE_RSC();
+    BLEAdvertising_init();
     initTachometer();
     initWebServer();
     
@@ -1189,7 +1210,7 @@ void loop() {
         
         static int wifiCounter = 0;
         wifiCounter++;
-        if (wifiCounter >= 100 * DISPLAY_UPDATE_INTERVAL) {
+        if (wifiCounter >= 20 * DISPLAY_UPDATE_INTERVAL) {
             checkWiFiConnection();
             wifiCounter = 0;
         }
