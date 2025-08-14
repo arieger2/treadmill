@@ -22,6 +22,13 @@ const char* BLE_DEVICE_NAME = "Rieger_Treatmill";
 // Hardware pins
 const int INTERRUPT_PIN = 4;
 const int LED_PIN = 2;
+const int SPEED_UP_PIN = 5;
+const int SPEED_DOWN_PIN = 12;
+const int INCLINE_UP_PIN = 13;
+const int INCLINE_DOWN_PIN = 14;
+const int SPEED_INC_DEC_FREQ = 300; //in micros
+const int TESTDATA_FREQ = 50;
+
 
 // Treadmill mechanics
 const long BELT_DISTANCE_MM = 191;  // Belt distance per revolution in mm
@@ -244,7 +251,7 @@ void sendFTMSStatusUpdate(uint8_t statusCode) {
 void resetWorkout() {
     metrics.workoutDistance = 0;
     metrics.totalRevCount = 0;
-    metrics.targetSpeed = 5;
+    metrics.targetSpeed = 0.0;
     metrics.targetInclination = 0;
     metrics.isRunning = false;
     metrics.isPaused = false;
@@ -300,15 +307,15 @@ class FTMSControlPointCallbacks : public BLECharacteristicCallbacks {
                     uint16_t speed = (data[2] << 8) | data[1];
                     float speedKmh = speed * 0.01;
                     Serial.printf("TARGET SPEED: %.2f km/h\n", speedKmh);
+                    Serial.println();
                     metrics.targetSpeed = speedKmh;
                     
                     // Automatically adjust offset to match target
-                    float currentSpeedKmh = (metrics.mps + metrics.mpsOffset) * 3.6;
-                    float adjustment = (speedKmh - currentSpeedKmh) / 3.6;
-                    metrics.mpsOffset += adjustment;
+                    float currentSpeedKmh = round((metrics.mps + metrics.mpsOffset) * 3.6 *10)/10;
                     
                     Serial.printf("Speed adjusted: Current %.1f -> Target %.1f (Offset: %.1f km/h)\n", 
                                   currentSpeedKmh, speedKmh, metrics.mpsOffset * 3.6);
+                    Serial.println();
                 } else {
                     response[2] = FTMS_INVALID_PARAMETER;
                 }
@@ -1137,6 +1144,17 @@ void checkWiFiConnection() {
 // MAIN FUNCTIONS
 // ============================================================================
 void setup() {
+    // initialize PINs
+    pinMode(SPEED_DOWN_PIN, OUTPUT);
+    pinMode(SPEED_UP_PIN, OUTPUT);
+    pinMode(INCLINE_DOWN_PIN, OUTPUT);
+    pinMode(INCLINE_UP_PIN, OUTPUT);
+    
+    digitalWrite(SPEED_UP_PIN, HIGH); // off
+    digitalWrite(SPEED_DOWN_PIN, HIGH); // off
+    digitalWrite(INCLINE_DOWN_PIN, HIGH); // off
+    digitalWrite(INCLINE_UP_PIN, HIGH); // off
+
     Serial.begin(115200);
     Serial.println("\n=== SMART BIDIRECTIONAL TREADMILL ===");
     Serial.println("Features:");
@@ -1172,47 +1190,67 @@ void setup() {
 // ============================================================================
 // 2. Add this temporary test function for manual data generation
 void generateTestData() {
-    static unsigned long lastTestTime = 0;
-    unsigned long currentTime = millis();
+    if ( !bleData.clientConnected) return;
     tachInterrupt();
 }
 
 void loop() {
     unsigned long currentTime = millis();
-    
-    // Handle delayed FTMS status update
-    static bool statusSent = false;
-    static unsigned long connectionTime = 0;
-    
-    if (bleData.clientConnected && !statusSent) {
-        if (connectionTime == 0) {
-            connectionTime = currentTime;
-        }
-        // Wait 1 second after connection before sending status
-        else if (currentTime - connectionTime > 1000) {
-            if (pFTMSStatus != nullptr) {
-                sendFTMSStatusUpdate(0x01);
-                statusSent = true;
-                Serial.println("FTMS control granted after stabilization");
+    static unsigned long previousloopTime = millis();
+    static unsigned long testdataElapsed = 0;
+    static unsigned long speedIncDecElapsed = 0;
+
+    if (currentTime < previousloopTime) {
+        // Handle micros() overflow (happens every ~70 minutes)
+        previousloopTime = currentTime;
+    }
+
+    // ADD THIS LINE FOR TESTING:
+    testdataElapsed += (currentTime - previousloopTime);
+    if (testdata && testdataElapsed > TESTDATA_FREQ) { // micros
+        //Serial.printf("testdataElapsed: %d -  currentTime - previousloopTime: %d  \n", testdataElapsed, currentTime - previousloopTime);
+        generateTestData(); // Remove this after testing with real treadmill
+        testdataElapsed = 0;
+    }
+
+        // handle speed changes from workouts
+    speedIncDecElapsed += (currentTime - previousloopTime);
+    if (speedIncDecElapsed > SPEED_INC_DEC_FREQ/2 &&  bleData.clientConnected && metrics.targetSpeed > 0) {
+        speedIncDecElapsed =0;
+        float currentSpeedKmh = round((metrics.mps + metrics.mpsOffset) * 3.6 *10)/10;
+        if (currentSpeedKmh == 0) return;
+        int stepAdjustment = (int)round((metrics.targetSpeed - currentSpeedKmh) * 10); // 0.1 km/h steps
+        if (digitalRead(SPEED_UP_PIN) == LOW || digitalRead(SPEED_DOWN_PIN) == LOW) {
+            digitalWrite(SPEED_UP_PIN, HIGH);
+            digitalWrite(SPEED_DOWN_PIN, HIGH);
+            //Serial.println("Set all PINs to LOW");
+        } else {
+            if (stepAdjustment > 0) {
+                digitalWrite(SPEED_UP_PIN, LOW);
+                Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
+                Serial.println("Speed increase");
+            } else if (stepAdjustment < 0) {
+                digitalWrite(SPEED_DOWN_PIN, LOW);
+                Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
+                Serial.println("Speed deincrease");
             }
         }
     }
-    
-    // Reset when disconnected
-    if (!bleData.clientConnected) {
-        statusSent = false;
-        connectionTime = 0;
+
+    if (bleData.clientConnected ) {
+        // Wait 1 second after connection before sending status
+        if (currentTime - previousloopTime > 1000) {
+            if (pFTMSStatus != nullptr) {
+                sendFTMSStatusUpdate(0x01);
+                Serial.println("FTMS control granted after stabilization");
+            }
+        }
     }
     
     // Your existing loop logic
     if (currentTime - metrics.lastUpdate >= DISPLAY_UPDATE_INTERVAL) {
         metrics.lastUpdate = currentTime;
         updateMetrics();
-        
-        // ADD THIS LINE FOR TESTING:
-        if (testdata) {
-            generateTestData(); // Remove this after testing with real treadmill
-        }
 
         // Send BLE data more frequently when client connected
         if (bleData.clientConnected) {
@@ -1239,5 +1277,6 @@ void loop() {
         }
     }
     
-    delay(10);
+    previousloopTime = currentTime;
+    //delay(10);
 }
