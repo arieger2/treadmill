@@ -9,6 +9,7 @@
 #include <esp_wifi.h>
 #include <ESPAsyncWebServer.h>
 #include <math.h>
+#include <limits.h>
 
 // ============================================================================
 // CONFIGURATION & CONSTANTS
@@ -26,8 +27,8 @@ const int SPEED_UP_PIN = 5;
 const int SPEED_DOWN_PIN = 12;
 const int INCLINE_UP_PIN = 13;
 const int INCLINE_DOWN_PIN = 14;
-const int SPEED_INC_DEC_FREQ = 300; //in micros
-const int TESTDATA_FREQ = 50;
+const uint32_t SPEED_INC_DEC_FREQ_MS = 100; //in minisec
+const uint32_t TESTDATA_FREQ_MS = 50;
 
 
 // Treadmill mechanics
@@ -65,8 +66,6 @@ const long MAX_REVOLUTION_TIME_US = 1000000;  // Max time for valid revolution (
 
 // Update intervals - FASTER UPDATES
 const unsigned long DISPLAY_UPDATE_INTERVAL = 500;  // 2 times per second 
-
-static bool testdata = false;
 
 // ============================================================================
 // GLOBAL VARIABLES
@@ -124,6 +123,7 @@ BLECharacteristic* pFTMSFitnessFeature = nullptr;
 BLECharacteristic* pFTMSSupportedSpeedRange = nullptr;
 BLECharacteristic* pFTMSSupportedInclinationRange = nullptr;
 
+static volatile bool testdata = false;
 
 AsyncWebServer server(80);
 // ============================================================================
@@ -171,6 +171,20 @@ void IRAM_ATTR tachInterrupt() {
             metrics.accumulatorInterval += elapsed;
         }
     }
+}
+
+void enableTestdata(bool on) {
+  if (on) {
+    detachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN)); // avoid real ISR
+    testdata = true;
+    metrics.isRunning = true;
+  } else {
+    testdata = false;
+    attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), tachInterrupt, FALLING);
+    metrics.isRunning = false;  // restore real state unless you want to keep running
+  }
+  Serial.printf("Test data: %s\n", testdata ? "ON" : "OFF");
+  Serial.println();
 }
 
 // ============================================================================
@@ -818,8 +832,8 @@ void calculateRPM() {
     unsigned long currentTime = millis();
     
     if (metrics.revCount > 0 && metrics.accumulatorInterval !=0) {
-        metrics.rpm = 60000000.0 / (metrics.accumulatorInterval / metrics.revCount);
-        metrics.sensorPulsPerSecond = (metrics.revCount * 60 *100000) / metrics.accumulatorInterval; // 1 Second
+        metrics.rpm = 60000000.0 / (double)(metrics.accumulatorInterval / metrics.revCount);
+        metrics.sensorPulsPerSecond = (metrics.revCount * 60 *100000) / metrics.accumulatorInterval; 
         metrics.accumulatorInterval = 0;
         lastValidRPMTime = currentTime;
         metrics.revCount = 0;
@@ -1072,15 +1086,7 @@ void initWebServer() {
     });
     
     server.on("/testdata", HTTP_GET, [](AsyncWebServerRequest *request) {
-        // FIXED: Toggle state here, not in template function
-        testdata = !testdata;
-        if(testdata) {
-            metrics.isRunning = true;
-        } else {
-            //metrics.isRunning = false;
-        }
-        Serial.printf("Test data toggled: %s\n", testdata ? "ON" : "OFF");
-        Serial.println();
+        enableTestdata(!testdata);
         request->send_P(200, "text/html", HTML_TEMPLATE, processTemplate);
     });
 
@@ -1195,54 +1201,57 @@ void generateTestData() {
 }
 
 void loop() {
-    unsigned long currentTime = millis();
-    static unsigned long previousloopTime = millis();
-    static unsigned long testdataElapsed = 0;
-    static unsigned long speedIncDecElapsed = 0;
+    uint32_t currentTime = millis();
+    static uint32_t previousTime = currentTime;
+    static uint32_t testdataElapsed = 0;
+    static uint32_t speedIncDecElapsed = 0;
 
-    if (currentTime < previousloopTime) {
-        // Handle micros() overflow (happens every ~70 minutes)
-        previousloopTime = currentTime;
-    }
+    uint32_t deltaPreviousTime = currentTime - previousTime;   // wrap-safe
 
     // ADD THIS LINE FOR TESTING:
-    testdataElapsed += (currentTime - previousloopTime);
-    if (testdata && testdataElapsed > TESTDATA_FREQ) { // micros
-        //Serial.printf("testdataElapsed: %d -  currentTime - previousloopTime: %d  \n", testdataElapsed, currentTime - previousloopTime);
+    testdataElapsed += deltaPreviousTime;
+    if (testdata && testdataElapsed > TESTDATA_FREQ_MS) { // millis
+        //Serial.printf("testdataElapsed: %d -  currentTime - previousTime: %d  \n", testdataElapsed, currentTime - previousTime);
         generateTestData(); // Remove this after testing with real treadmill
         testdataElapsed = 0;
     }
 
-        // handle speed changes from workouts
-    speedIncDecElapsed += (currentTime - previousloopTime);
-    if (speedIncDecElapsed > SPEED_INC_DEC_FREQ/2 &&  bleData.clientConnected && metrics.targetSpeed > 0) {
-        speedIncDecElapsed =0;
-        float currentSpeedKmh = round((metrics.mps + metrics.mpsOffset) * 3.6 *10)/10;
-        if (currentSpeedKmh == 0) return;
-        int stepAdjustment = (int)round((metrics.targetSpeed - currentSpeedKmh) * 10); // 0.1 km/h steps
-        if (digitalRead(SPEED_UP_PIN) == LOW || digitalRead(SPEED_DOWN_PIN) == LOW) {
-            digitalWrite(SPEED_UP_PIN, HIGH);
-            digitalWrite(SPEED_DOWN_PIN, HIGH);
-            //Serial.println("Set all PINs to LOW");
-        } else {
-            if (stepAdjustment > 0) {
-                digitalWrite(SPEED_UP_PIN, LOW);
-                Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
-                Serial.println("Speed increase");
-            } else if (stepAdjustment < 0) {
-                digitalWrite(SPEED_DOWN_PIN, LOW);
-                Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
-                Serial.println("Speed deincrease");
-            }
+    static uint32_t connectAt = 0;
+    if (bleData.clientConnected) {
+        if (connectAt == 0) connectAt = currentTime;
+        if (currentTime - connectAt >= 1000 && pFTMSStatus) {
+            sendFTMSStatusUpdate(0x01);
+            connectAt = UINT32_MAX; // fire once
+            Serial.println("FTMS control granted after stabilization");
         }
+    } else {
+        connectAt = 0; // reset only when disconnected
     }
 
-    if (bleData.clientConnected ) {
-        // Wait 1 second after connection before sending status
-        if (currentTime - previousloopTime > 1000) {
-            if (pFTMSStatus != nullptr) {
-                sendFTMSStatusUpdate(0x01);
-                Serial.println("FTMS control granted after stabilization");
+        // handle speed changes from workouts
+    speedIncDecElapsed += deltaPreviousTime;
+    if (speedIncDecElapsed > SPEED_INC_DEC_FREQ_MS/2 &&  bleData.clientConnected && metrics.targetSpeed > 0) {
+        speedIncDecElapsed =0;
+        //float currentSpeedKmh = round((metrics.mps + metrics.mpsOffset) * 3.6 *10)/10;
+        float currentSpeedKmh = ((metrics.mps + metrics.mpsOffset) * 3.6f);
+        currentSpeedKmh = floorf(currentSpeedKmh * 10.0f + 0.5f) / 10.0f; // round to 0.1
+        if (currentSpeedKmh > 0.0f) {
+            float diff = metrics.targetSpeed - currentSpeedKmh;
+            int stepAdjustment = (int)(diff * 10.0f + (diff >= 0 ? 0.5f : -0.5f)); // 0.1 km/h steps
+            if (digitalRead(SPEED_UP_PIN) == LOW || digitalRead(SPEED_DOWN_PIN) == LOW) {
+                digitalWrite(SPEED_UP_PIN, HIGH);
+                digitalWrite(SPEED_DOWN_PIN, HIGH);
+                //Serial.println("Set all PINs to LOW");
+            } else {
+                if (stepAdjustment > 0) {
+                    digitalWrite(SPEED_UP_PIN, LOW);
+                    //Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
+                    //Serial.println("Speed increase");
+                } else if (stepAdjustment < 0) {
+                    digitalWrite(SPEED_DOWN_PIN, LOW);
+                    //Serial.printf("0.1km/h Speed adjustment: %d \n", stepAdjustment);
+                    //Serial.println("Speed de/increase");
+                }
             }
         }
     }
@@ -1253,14 +1262,14 @@ void loop() {
         updateMetrics();
 
         // Send BLE data more frequently when client connected
-        if (bleData.clientConnected) {
+        if (bleData.clientConnected ) {
             sendFTMS_BLE_Data();
             
             // Debug output every few seconds
             static int debugCounter = 0;
             debugCounter++;
             if (debugCounter >= 60 && testdata) { // Every 3 seconds (500ms * 6)
-                Serial.printf("Status: RPM=%d, Speed=%.1f km/h, Distance=%dm, Running=%s\n",
+                Serial.printf("Status: RPM=%d, Speed=%.1f km/h, Distance=%dkm, Running=%s\n",
                             (int)metrics.rpm,
                             (metrics.mps + metrics.mpsOffset) * 3.6,
                             (int)(metrics.workoutDistance / 1000),
@@ -1270,13 +1279,14 @@ void loop() {
             }
         }
         
-        static unsigned long lastWiFiTick = 0;
-        if (millis() - lastWiFiTick >= 500) {     // check every 500 ms non-blocking
-            lastWiFiTick = millis();
-            checkWiFiConnection();
-        }
+        
+    }
+    static unsigned long lastWiFiTick = 0;
+    if (millis() - lastWiFiTick >= 500) {     // check every 500 ms non-blocking
+        lastWiFiTick = millis();
+        checkWiFiConnection();
     }
     
-    previousloopTime = currentTime;
+    previousTime = currentTime;
     //delay(10);
 }
