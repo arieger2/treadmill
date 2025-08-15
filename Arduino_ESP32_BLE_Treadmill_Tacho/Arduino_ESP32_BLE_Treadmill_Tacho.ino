@@ -106,6 +106,7 @@ struct BLEData {
 };
 
 static uint8_t cpPending[3];
+static size_t  cpPendingLen = 0;
 static bool cpHasPending = false;
 
 TreadmillMetrics metrics;
@@ -232,20 +233,12 @@ bool isRSCNotificationEnabled() {
 }
 
 bool isIndicationEnabled(BLECharacteristic* c) {
-  if (!c) return false;
-  BLEDescriptor* d = c->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
-  if (!d) return false;
-  // Cast to BLE2902 to use the helper that reflects the client’s CCCD state
-  BLE2902* cccd = static_cast<BLE2902*>(d);
-  return cccd && cccd->getIndications();   // true when the central enabled indications
+    if (!c) return false;
+    BLEDescriptor* d = c->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+    if (!d) return false;
+    BLE2902* cccd = static_cast<BLE2902*>(d);
+    return cccd && cccd->getIndications();
 }
-/* bevor CCCD changes
-void sendFTMSStatusUpdate(uint8_t statusCode) {
-    if (!bleData.clientConnected || !pFTMSStatus) {
-        Serial.println("Cannot send FTMS status - not connected or invalid characteristic");
-        return;
-    }
-*/
 // After
 void sendFTMSStatusUpdate(uint8_t statusCode) {
     if (!pFTMSStatus) {
@@ -296,6 +289,7 @@ void resetWorkout() {
     metrics.isPaused = false;
     metrics.sessionStartTime = millis();
     setTime(0, 0, 0, 0, 0, 0);
+    testdata = false;
     Serial.println("Workout reset via FTMS command");
 }
 
@@ -390,8 +384,9 @@ class FTMSControlPointCallbacks : public BLECharacteristicCallbacks {
                 if (length >= 2) {
                     if (data[1] == 0x01) {
                         Serial.println("STOP command");
-                        metrics.isRunning = false;
-                        metrics.isPaused = false;
+                        //metrics.isRunning = false;
+                        //metrics.isPaused = false;
+                        resetWorkout();
                         sendFTMSStatusUpdate(0x05);
                     } else if (data[1] == 0x02) {
                         Serial.println("PAUSE command");
@@ -409,19 +404,23 @@ class FTMSControlPointCallbacks : public BLECharacteristicCallbacks {
         
         // Send response (only if indications enabled)
         pFTMSControlPoint->setValue(response, 3);
-        // Prefer spec-correct Indicate; fall back to Notify if the client didn’t enable Indicate
-        if (cccdHasIndicate(pFTMSControlPoint)) {
+
+        BLE2902* cccd = (BLE2902*)pFTMSControlPoint->getDescriptorByUUID(BLEUUID((uint16_t)0x2902));
+        bool canInd = cccd && cccd->getIndications();
+        bool canNot = cccd && cccd->getNotifications();
+
+        if (canInd) {
             pFTMSControlPoint->indicate();
-        } else if (cccdHasNotify(pFTMSControlPoint)) {
-            pFTMSControlPoint->notify(); // fallback for older stacks
-            Serial.println("Sent CP response via NOTIFY (indications disabled)");
+        } else if (canNot) {
+            pFTMSControlPoint->notify(); // fallback path
+            Serial.println("Sent CP via NOTIFY (indications disabled)");
         } else {
-            // queue as you already do
-            memcpy(cpPending, response, 3);
+        memcpy(cpPending, response, 3);
+            cpPendingLen = 3;
             cpHasPending = true;
             Serial.println("Queued CP response until CCCD enabled (neither notify nor indicate set)");
         }
-        
+
         Serial.println("=== FTMS COMMAND COMPLETE ===");
     }
 };
@@ -457,37 +456,22 @@ class ServerCallbacks : public BLEServerCallbacks {
 // ============================================================================
 // Optional: Custom CCCD callback to track when client enables/disables notifications
 class CCCDCallbacks : public BLEDescriptorCallbacks {
-    /*
-    void onWrite(BLEDescriptor* pDescriptor) override {
-        uint8_t* data = pDescriptor->getValue();
-        if (pDescriptor->getLength() >= 2) {
-            uint16_t cccdValue = data[0] | (data[1] << 8);
-            
-            BLECharacteristic* pChar = pDescriptor->getCharacteristic();
-            String charUUID = pChar->getUUID().toString().c_str();
-            
-            Serial.printf("CCCD Write - Char: %s, Value: 0x%04X ", charUUID.c_str(), cccdValue);
-            
-            if (cccdValue & 0x0001) {
-                Serial.println("(Notifications ENABLED)");
-            } else if (cccdValue & 0x0002) {
-                Serial.println("(Indications ENABLED)");
-            } else {
-                Serial.println("(Notifications/Indications DISABLED)");
-            }
-        }
-    } */
-    void onWrite(BLEDescriptor* pDescriptor) override {
-        BLECharacteristic* pChar = pDescriptor->getCharacteristic();
-        BLE2902* cccd = static_cast<BLE2902*>(pDescriptor);
-        if (!pChar || !cccd) return;
+  void onWrite(BLEDescriptor* d) override {
+        BLECharacteristic* ch = d->getCharacteristic();
+        BLE2902* cccd = (BLE2902*)d;
+        if (!ch || !cccd) return;
 
-        if (cccd->getIndications() && cpHasPending &&
-            pChar->getUUID().equals(BLEUUID(FTMS_CONTROL_POINT_UUID))) {
-            pChar->setValue(cpPending, 3);
-            pChar->indicate();
+        // Log so you can SEE it happen on new/old Macs
+        Serial.printf("CCCD Write - Char: %s  notify=%d indicate=%d\n",
+                    ch->getUUID().toString().c_str(), cccd->getNotifications(), cccd->getIndications());
+
+        // If the Control Point CCCD just got enabled, flush queued response
+        if (ch->getUUID().equals(BLEUUID(FTMS_CONTROL_POINT_UUID)) && cpHasPending) {
+            ch->setValue(cpPending, cpPendingLen);
+            if (cccd->getIndications()) ch->indicate();
+            else if (cccd->getNotifications()) ch->notify();
             cpHasPending = false;
-            Serial.println("Sent queued CP indication after CCCD enable");
+            Serial.println("Sent queued CP response after CCCD enable");
         }
     }
 };
@@ -571,8 +555,7 @@ void initFTMS_BLE() {
         pFTMSControlPoint = pFTMSService->createCharacteristic(
                                     FTMS_CONTROL_POINT_UUID,
                                     BLECharacteristic::PROPERTY_WRITE |
-                                    BLECharacteristic::PROPERTY_INDICATE |
-                                    BLECharacteristic::PROPERTY_NOTIFY
+                                    BLECharacteristic::PROPERTY_INDICATE 
                                 );
         
         // Create Status Characteristic (Read + Notify)
@@ -596,8 +579,9 @@ void initFTMS_BLE() {
         
         if (pFTMSTreadmillData) {
             BLE2902* ftmsDataDescriptor = new BLE2902();
-            ftmsDataDescriptor->setNotifications(true);
-            ftmsDataDescriptor->setIndications(false);
+            ftmsDataDescriptor->setNotifications(false);
+            ftmsDataDescriptor->setIndications(false);//false
+            ftmsDataDescriptor->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
             ftmsDataDescriptor->setCallbacks(new CCCDCallbacks());
             pFTMSTreadmillData->addDescriptor(ftmsDataDescriptor);
             Serial.println("✅ Added CCCD to FTMS Treadmill Data");
@@ -605,8 +589,9 @@ void initFTMS_BLE() {
         
         if (pFTMSControlPoint) {
             BLE2902* cpDescriptor = new BLE2902();
-            cpDescriptor->setIndications(true);
-            cpDescriptor->setNotifications(false);
+            cpDescriptor->setIndications(false);
+            cpDescriptor->setNotifications(false);//false
+            cpDescriptor->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
             cpDescriptor->setCallbacks(new CCCDCallbacks());
             pFTMSControlPoint->addDescriptor(cpDescriptor);
             pFTMSControlPoint->setCallbacks(new FTMSControlPointCallbacks());
@@ -615,8 +600,9 @@ void initFTMS_BLE() {
         
         if (pFTMSStatus) {
             BLE2902* statusDescriptor = new BLE2902();
-            statusDescriptor->setNotifications(true);
-            statusDescriptor->setIndications(false);
+            statusDescriptor->setNotifications(false);
+            statusDescriptor->setIndications(false);//false
+            statusDescriptor->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
             statusDescriptor->setCallbacks(new CCCDCallbacks());
             pFTMSStatus->addDescriptor(statusDescriptor);
             Serial.println("✅ Added CCCD to FTMS Status");
@@ -677,6 +663,12 @@ void initFTMS_BLE() {
         uint8_t status = 0x00; // Machine idle
         if (pFTMSStatus) {
             pFTMSStatus->setValue(&status, 1);
+        }
+        if (cccdHasNotify(pFTMSStatus)) {
+            pFTMSStatus->notify();
+            Serial.println("FTMS Status notified");
+        } else {
+            Serial.println("FTMS Status notify skipped (CCCD off)");
         }
       
         pFTMSService->start();
